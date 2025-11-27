@@ -7,11 +7,19 @@ on:
 jobs:
   process-file:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # Increased timeout for large files
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_PAT }}
+
+      - name: Setup environment
+        run: |
+          # Install additional tools for better file handling
+          sudo apt-get update
+          sudo apt-get install -y wget pv file
 
       - name: Process File
         run: |
@@ -33,21 +41,40 @@ jobs:
             # Create folder for extraction
             mkdir -p "$FOLDER_NAME"
             
-            # Download ZIP file with retry for large files
+            # Download ZIP file with advanced error handling
             ZIP_FILE="temp_download.zip"
-            echo "Downloading ZIP file..."
+            echo "📦 Downloading ZIP file..."
             
-            # Use wget instead of curl for better large file handling
-            if wget --tries=3 --timeout=60 -O "$ZIP_FILE" "${{ github.event.client_payload.pdf_url }}"; then
-              echo "✓ ZIP downloaded successfully"
+            # Multiple download methods with fallback
+            download_success=false
+            
+            # Method 1: wget with retry and progress
+            if wget --tries=3 --timeout=120 --show-progress -O "$ZIP_FILE" "${{ github.event.client_payload.pdf_url }}"; then
+              download_success=true
+            # Method 2: curl fallback  
+            elif curl -L --retry 3 --retry-delay 5 --max-time 300 --progress-bar -o "$ZIP_FILE" "${{ github.event.client_payload.pdf_url }}"; then
+              download_success=true
+            else
+              echo "❌ All download methods failed"
+              exit 1
+            fi
+            
+            if [ "$download_success" = true ]; then
+              echo "✅ ZIP downloaded successfully"
               ZIP_SIZE=$(ls -lh "$ZIP_FILE" | cut -d ' ' -f 5)
-              echo "File size: $ZIP_SIZE"
+              echo "📊 File size: $ZIP_SIZE"
+              
+              # Validate ZIP file
+              if ! unzip -t -q "$ZIP_FILE"; then
+                echo "❌ ZIP file is corrupted or invalid"
+                exit 1
+              fi
               
               # Extract ZIP file
-              echo "Extracting ZIP file..."
+              echo "📂 Extracting ZIP file..."
               if unzip -q "$ZIP_FILE" -d "$FOLDER_NAME/"; then
                 FILE_COUNT=$(find "$FOLDER_NAME" -type f | wc -l)
-                echo "✓ Extracted $FILE_COUNT files to $FOLDER_NAME/"
+                echo "✅ Extracted $FILE_COUNT files to $FOLDER_NAME/"
                 
                 # Clean up ZIP file
                 rm -f "$ZIP_FILE"
@@ -56,16 +83,16 @@ jobs:
                 git add .
                 git commit -m "Add extracted files: $FOLDER_NAME ($FILE_COUNT files)"
                 git pull --rebase --quiet
-                git push --quiet
-                
-                echo "✓ ZIP extraction completed successfully"
+                if git push --quiet; then
+                  echo "✅ ZIP extraction completed successfully"
+                else
+                  echo "❌ Git push failed"
+                  exit 1
+                fi
               else
-                echo "✗ Failed to extract ZIP file"
+                echo "❌ Failed to extract ZIP file"
                 exit 1
               fi
-            else
-              echo "✗ Failed to download ZIP file after 3 attempts"
-              exit 1
             fi
           else
             echo "=== PROCESSING PDF FILE ==="
@@ -74,37 +101,53 @@ jobs:
             CLEAN_FILENAME="${{ github.event.client_payload.file_name }}"
             PDF_FILENAME="pdfs/${CLEAN_FILENAME}"
             
-            echo "PDF URL: ${{ github.event.client_payload.pdf_url }}"
-            echo "Saving as: $PDF_FILENAME"
+            echo "📄 PDF URL: ${{ github.event.client_payload.pdf_url }}"
+            echo "💾 Saving as: $PDF_FILENAME"
             
-            # Download PDF with retry and resume support for large files
-            echo "Downloading PDF file..."
+            # Download PDF with advanced error handling
+            echo "⬇️ Downloading PDF file..."
+            download_success=false
             
-            # Use wget with retry and continue support
-            if wget --tries=3 --timeout=120 --continue -O "$PDF_FILENAME" "${{ github.event.client_payload.pdf_url }}"; then
-              echo "✓ PDF downloaded successfully"
+            # Method 1: wget with retry and progress
+            if wget --tries=3 --timeout=120 --show-progress -O "$PDF_FILENAME" "${{ github.event.client_payload.pdf_url }}"; then
+              download_success=true
+            # Method 2: curl fallback
+            elif curl -L --retry 3 --retry-delay 5 --max-time 300 --progress-bar -o "$PDF_FILENAME" "${{ github.event.client_payload.pdf_url }}"; then
+              download_success=true
+            else
+              echo "❌ All download methods failed"
+              exit 1
+            fi
+            
+            if [ "$download_success" = true ]; then
+              echo "✅ PDF downloaded successfully"
               PDF_SIZE=$(ls -lh "$PDF_FILENAME" | cut -d ' ' -f 5)
-              echo "File size: $PDF_SIZE"
+              echo "📊 File size: $PDF_SIZE"
               
-              # Verify file is not empty and is a valid PDF
-              if [ -s "$PDF_FILENAME" ] && file "$PDF_FILENAME" | grep -q "PDF"; then
-                echo "✓ File verification passed - Valid PDF"
+              # Enhanced file validation
+              if [ ! -s "$PDF_FILENAME" ]; then
+                echo "❌ Downloaded file is empty"
+                exit 1
+              fi
+              
+              # Check if file is a valid PDF
+              if file "$PDF_FILENAME" | grep -q "PDF"; then
+                echo "✅ File verification passed - Valid PDF"
                 
                 git add .
                 git commit -m "Add PDF: $CLEAN_FILENAME"
                 git pull --rebase --quiet
-                git push --quiet
-                
-                echo "✓ PDF upload completed successfully"
+                if git push --quiet; then
+                  echo "✅ PDF upload completed successfully"
+                else
+                  echo "❌ Git push failed"
+                  exit 1
+                fi
               else
-                echo "✗ Downloaded file is empty, corrupted, or not a PDF"
-                # Check what type of file it actually is
-                file "$PDF_FILENAME"
+                ACTUAL_TYPE=$(file "$PDF_FILENAME")
+                echo "❌ Downloaded file is not a PDF. Actual type: $ACTUAL_TYPE"
                 exit 1
               fi
-            else
-              echo "✗ Failed to download PDF file after 3 attempts"
-              exit 1
             fi
           fi
 
@@ -128,5 +171,18 @@ jobs:
             curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
               -d "chat_id=$CHAT_ID" \
               -d "text=$MESSAGE"
-            echo "✓ Notification sent successfully"
+            echo "📩 Notification sent successfully"
+          fi
+
+      - name: Send error notification
+        if: failure()
+        run: |
+          CHAT_ID="${{ github.event.client_payload.chat_id }}"
+          FILENAME="${{ github.event.client_payload.file_name }}"
+          
+          if [ -n "$CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+              -d "chat_id=$CHAT_ID" \
+              -d "text=❌ Upload Failed%0A%0A📄 File: $FILENAME%0A🚨 Error: Please try again or check the file link"
+            echo "📩 Error notification sent"
           fi
