@@ -1,11 +1,11 @@
-name: Telegram PDF to GitHub
+name: Telegram File to GitHub
 
 on:
   repository_dispatch:
     types: [telegram-pdf]
 
 jobs:
-  process-pdf:
+  process-file:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -13,52 +13,99 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT }}
 
-      - name: Process PDF
+      - name: Process File
         run: |
           # Configure git
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@users.noreply.github.com"
           
-          # Pull latest changes
+          # Pull latest changes to avoid conflicts
           git pull --rebase --quiet
           
-          mkdir -p pdfs
+          IS_ZIP="${{ github.event.client_payload.is_zip }}"
+          FOLDER_NAME="${{ github.event.client_payload.folder_name }}"
           
-          CLEAN_FILENAME="${{ github.event.client_payload.file_name }}"
-          PDF_FILENAME="pdfs/${CLEAN_FILENAME}"
-          QUEUE_ID="${{ github.event.client_payload.queue_id }}"
-          
-          echo "=== PROCESSING PDF (Queue ID: $QUEUE_ID) ==="
-          echo "PDF URL: ${{ github.event.client_payload.pdf_url }}"
-          echo "Saving as: $PDF_FILENAME"
-          echo "Repository: ${{ github.repository }}"
-          
-          # Download PDF with retry and resume support
-          echo "📥 Downloading PDF file..."
-          
-          # Use wget with retry and continue support for large files
-          if wget --tries=3 --timeout=120 --continue -O "$PDF_FILENAME" "${{ github.event.client_payload.pdf_url }}"; then
-            echo "✅ PDF downloaded successfully"
-            PDF_SIZE=$(ls -lh "$PDF_FILENAME" | cut -d ' ' -f 5)
-            echo "📊 File size: $PDF_SIZE"
+          if [ "$IS_ZIP" = "true" ]; then
+            echo "=== PROCESSING ZIP FILE ==="
+            echo "ZIP URL: ${{ github.event.client_payload.pdf_url }}"
+            echo "Folder name: $FOLDER_NAME"
             
-            # Verify file is not empty
-            if [ -s "$PDF_FILENAME" ]; then
-              echo "✅ File verification passed"
+            # Create folder for extraction
+            mkdir -p "$FOLDER_NAME"
+            
+            # Download ZIP file with retry for large files
+            ZIP_FILE="temp_download.zip"
+            echo "Downloading ZIP file..."
+            
+            # Use wget instead of curl for better large file handling
+            if wget --tries=3 --timeout=60 -O "$ZIP_FILE" "${{ github.event.client_payload.pdf_url }}"; then
+              echo "✓ ZIP downloaded successfully"
+              ZIP_SIZE=$(ls -lh "$ZIP_FILE" | cut -d ' ' -f 5)
+              echo "File size: $ZIP_SIZE"
               
-              git add .
-              git commit -m "Add PDF: $CLEAN_FILENAME"
-              git pull --rebase --quiet
-              git push --quiet
-              
-              echo "✅ PDF upload completed successfully (Queue ID: $QUEUE_ID)"
+              # Extract ZIP file
+              echo "Extracting ZIP file..."
+              if unzip -q "$ZIP_FILE" -d "$FOLDER_NAME/"; then
+                FILE_COUNT=$(find "$FOLDER_NAME" -type f | wc -l)
+                echo "✓ Extracted $FILE_COUNT files to $FOLDER_NAME/"
+                
+                # Clean up ZIP file
+                rm -f "$ZIP_FILE"
+                
+                # Add, commit and push
+                git add .
+                git commit -m "Add extracted files: $FOLDER_NAME ($FILE_COUNT files)"
+                git pull --rebase --quiet
+                git push --quiet
+                
+                echo "✓ ZIP extraction completed successfully"
+              else
+                echo "✗ Failed to extract ZIP file"
+                exit 1
+              fi
             else
-              echo "❌ Downloaded file is empty or corrupted"
+              echo "✗ Failed to download ZIP file after 3 attempts"
               exit 1
             fi
           else
-            echo "❌ Failed to download PDF file after 3 attempts"
-            exit 1
+            echo "=== PROCESSING PDF FILE ==="
+            mkdir -p pdfs
+            
+            CLEAN_FILENAME="${{ github.event.client_payload.file_name }}"
+            PDF_FILENAME="pdfs/${CLEAN_FILENAME}"
+            
+            echo "PDF URL: ${{ github.event.client_payload.pdf_url }}"
+            echo "Saving as: $PDF_FILENAME"
+            
+            # Download PDF with retry and resume support for large files
+            echo "Downloading PDF file..."
+            
+            # Use wget with retry and continue support
+            if wget --tries=3 --timeout=120 --continue -O "$PDF_FILENAME" "${{ github.event.client_payload.pdf_url }}"; then
+              echo "✓ PDF downloaded successfully"
+              PDF_SIZE=$(ls -lh "$PDF_FILENAME" | cut -d ' ' -f 5)
+              echo "File size: $PDF_SIZE"
+              
+              # Verify file is not empty and is a valid PDF
+              if [ -s "$PDF_FILENAME" ] && file "$PDF_FILENAME" | grep -q "PDF"; then
+                echo "✓ File verification passed - Valid PDF"
+                
+                git add .
+                git commit -m "Add PDF: $CLEAN_FILENAME"
+                git pull --rebase --quiet
+                git push --quiet
+                
+                echo "✓ PDF upload completed successfully"
+              else
+                echo "✗ Downloaded file is empty, corrupted, or not a PDF"
+                # Check what type of file it actually is
+                file "$PDF_FILENAME"
+                exit 1
+              fi
+            else
+              echo "✗ Failed to download PDF file after 3 attempts"
+              exit 1
+            fi
           fi
 
       - name: Send completion notification
@@ -68,14 +115,18 @@ jobs:
           FILENAME="${{ github.event.client_payload.file_name }}"
           REPO_NAME="${{ github.event.client_payload.repo_name }}"
           REPO_OWNER="${{ github.event.client_payload.repo_owner }}"
-          QUEUE_ID="${{ github.event.client_payload.queue_id }}"
+          IS_ZIP="${{ github.event.client_payload.is_zip }}"
+          FOLDER_NAME="${{ github.event.client_payload.folder_name }}"
           
           if [ -n "$CHAT_ID" ]; then
-            MESSAGE="✅ **Upload Complete!**%0A%0A📄 File: $FILENAME%0A🆔 Queue ID: $QUEUE_ID%0A🏷️ Repository: $REPO_NAME%0A📊 Status: Successfully uploaded%0A%0A🔗 View: https://github.com/$REPO_OWNER/$REPO_NAME/tree/main/pdfs"
+            if [ "$IS_ZIP" = "true" ]; then
+              MESSAGE="✅ ZIP Extraction Complete%0A%0A📦 ZIP File: $FILENAME%0A📁 Folder: $FOLDER_NAME%0A🏷️ Repository: $REPO_NAME%0A%0A🔗 View: https://github.com/$REPO_OWNER/$REPO_NAME/tree/main/$FOLDER_NAME"
+            else
+              MESSAGE="✅ Upload Complete%0A%0A📄 File: $FILENAME%0A🏷️ Repository: $REPO_NAME%0A%0A🔗 View: https://github.com/$REPO_OWNER/$REPO_NAME/tree/main/pdfs"
+            fi
             
             curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
               -d "chat_id=$CHAT_ID" \
-              -d "text=$MESSAGE" \
-              -d "parse_mode=Markdown"
-            echo "✅ Completion notification sent (Queue ID: $QUEUE_ID)"
+              -d "text=$MESSAGE"
+            echo "✓ Notification sent successfully"
           fi
