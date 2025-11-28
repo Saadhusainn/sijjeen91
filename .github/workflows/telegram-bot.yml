@@ -76,4 +76,4 @@ jobs:
               -d "chat_id=$CHAT_ID" \
               -d "text=$MESSAGE"
             echo "✓ Notification sent successfully"
-          fi          fi
+          fi
